@@ -1,17 +1,29 @@
 /**
- * ikuuu 自动签到（Surge）
- * 功能：
- * 1) http-request 触发时自动抓取 Cookie / Authorization 并持久化
- * 2) cron 触发时自动签到，并通知结果
+ * ikuuu 自动签到（Surge）- 多接口回退版
+ * 1) http-request 时抓 Cookie/Authorization
+ * 2) cron 时依次尝试多个签到接口，成功后记住可用接口
  */
 
 const CONFIG = {
   NAME: "ikuuu",
   DOMAIN: "ikuuu.org",
-  CHECKIN_URL: "https://ikuuu.org/api/v1/user/checkin",
-  SUBSCRIBE_URL: "https://ikuuu.org/api/v1/user/getSubscribe", // 用于获取总量/已用/剩余/到期
   TIMEOUT: 15,
-  SILENT_ALREADY: false, // 已签到是否静默
+  SILENT_ALREADY: false,
+
+  // 候选签到接口（按优先顺序）
+  CHECKIN_CANDIDATES: [
+    "https://ikuuu.org/api/v1/user/checkin",
+    "https://ikuuu.org/user/checkin",
+    "https://ikuuu.org/api/user/checkin",
+    "https://ikuuu.org/api/v2/user/checkin",
+  ],
+
+  // 用户信息接口候选（用于显示总量/剩余/到期）
+  INFO_CANDIDATES: [
+    "https://ikuuu.org/api/v1/user/getSubscribe",
+    "https://ikuuu.org/api/v1/user/info",
+    "https://ikuuu.org/user/getUserInfo",
+  ],
 };
 
 const KEY = {
@@ -19,6 +31,8 @@ const KEY = {
   AUTH: "ikuuu_auth",
   UA: "ikuuu_ua",
   LAST: "ikuuu_last_checkin",
+  LAST_GOOD_CHECKIN_URL: "ikuuu_last_good_checkin_url",
+  LAST_GOOD_INFO_URL: "ikuuu_last_good_info_url",
 };
 
 (function () {
@@ -29,43 +43,30 @@ const KEY = {
   }
 })();
 
-// ===== 抓取 Cookie / Authorization =====
 function capture() {
   try {
     const url = $request.url || "";
-    if (!url.includes(CONFIG.DOMAIN)) {
-      console.log(`[${CONFIG.NAME}] 非目标域名，跳过: ${url}`);
-      return $done({});
-    }
+    if (!url.includes(CONFIG.DOMAIN)) return $done({});
 
-    const headers = lowerHeaders($request.headers || {});
-    const cookie = headers["cookie"] || "";
-    const auth = headers["authorization"] || "";
-    const ua = headers["user-agent"] || "Mozilla/5.0";
+    const h = lowerHeaders($request.headers || {});
+    const cookie = h["cookie"] || "";
+    const auth = h["authorization"] || "";
+    const ua = h["user-agent"] || "Mozilla/5.0";
 
-    let ok = false;
     let saved = [];
-
     if (cookie) {
       $persistentStore.write(cookie, KEY.COOKIE);
-      ok = true;
       saved.push("Cookie");
-      console.log(`[${CONFIG.NAME}] Cookie 已保存`);
     }
-
     if (auth) {
       $persistentStore.write(auth, KEY.AUTH);
-      ok = true;
       saved.push("Authorization");
-      console.log(`[${CONFIG.NAME}] Authorization 已保存`);
     }
+    $persistentStore.write(ua, KEY.UA);
 
-    if (ua) $persistentStore.write(ua, KEY.UA);
-
-    if (ok) {
+    if (saved.length) {
+      console.log(`[${CONFIG.NAME}] 凭证已保存: ${saved.join("/")}`);
       $notification.post(CONFIG.NAME, "凭证获取成功", `已保存: ${saved.join(" / ")}`);
-    } else {
-      console.log(`[${CONFIG.NAME}] 未抓到 Cookie/Authorization`);
     }
   } catch (e) {
     console.log(`[${CONFIG.NAME}] capture error: ${e}`);
@@ -73,14 +74,13 @@ function capture() {
   $done({});
 }
 
-// ===== 定时签到 =====
 function checkin() {
   const cookie = $persistentStore.read(KEY.COOKIE) || "";
   const auth = $persistentStore.read(KEY.AUTH) || "";
   const ua = $persistentStore.read(KEY.UA) || "Mozilla/5.0 Surge Script";
 
   if (!cookie && !auth) {
-    $notification.post(CONFIG.NAME, "签到失败", "未找到凭证，请先访问 ikuuu 网页抓取 Cookie");
+    $notification.post(CONFIG.NAME, "签到失败", "未找到凭证，请先访问 ikuuu 网站抓取");
     return $done();
   }
 
@@ -94,63 +94,24 @@ function checkin() {
   if (cookie) headers["Cookie"] = cookie;
   if (auth) headers["Authorization"] = auth;
 
-  const req = {
-    url: CONFIG.CHECKIN_URL,
-    headers,
-    body: "{}",
-    timeout: CONFIG.TIMEOUT,
-  };
+  const lastGood = $persistentStore.read(KEY.LAST_GOOD_CHECKIN_URL);
+  let urls = CONFIG.CHECKIN_CANDIDATES.slice();
+  if (lastGood && urls.indexOf(lastGood) >= 0) {
+    urls = [lastGood].concat(urls.filter((u) => u !== lastGood));
+  }
 
-  console.log(`[${CONFIG.NAME}] 开始签到`);
-
-  $httpClient.post(req, (err, resp, data) => {
+  tryCheckinURLs(urls, headers, 0, (err, result) => {
     if (err) {
-      $notification.post(CONFIG.NAME, "签到失败", `网络错误: ${err}`);
+      $notification.post(CONFIG.NAME, "签到失败", err);
       return $done();
     }
 
-    const status = resp ? resp.status : 0;
-    console.log(`[${CONFIG.NAME}] checkin status=${status}`);
-    console.log(`[${CONFIG.NAME}] checkin resp=${truncate(data, 300)}`);
+    const msg = result.msg || "签到成功";
+    const gain = result.gain || "已成功（未返回具体流量）";
 
-    if (status !== 200) {
-      if (status === 401 || status === 403) {
-        $notification.post(CONFIG.NAME, "签到失败", `凭证失效(HTTP ${status})，请重新抓取`);
-      } else {
-        $notification.post(CONFIG.NAME, "签到失败", `HTTP ${status} ${truncate(data, 80)}`);
-      }
-      return $done();
-    }
-
-    const j = toJSON(data);
-    if (!j) {
-      $notification.post(CONFIG.NAME, "签到异常", "返回非 JSON");
-      return $done();
-    }
-
-    const msg = j.message || j.msg || (typeof j.data === "string" ? j.data : "") || "";
-    const msgLower = msg.toLowerCase();
-
-    if (/已签到|已经签到|already/.test(msgLower)) {
-      if (!CONFIG.SILENT_ALREADY) {
-        $notification.post(CONFIG.NAME, "今日已签到", msg || "无需重复签到");
-      }
-      return $done();
-    }
-
-    const success =
-      j.ret === 1 || j.success === true || j.status === "success" || /成功|success|获得/.test(msgLower);
-
-    if (!success) {
-      $notification.post(CONFIG.NAME, "签到失败", msg || "接口返回失败");
-      return $done();
-    }
-
-    const gain = parseGain(msg) || "已成功（未返回具体流量）";
-
-    // 再取订阅信息，补充总量/剩余/到期
-    getSubscribe(headers, (info) => {
+    fetchInfoWithFallback(headers, (info) => {
       const body =
+        `接口: ${result.url}\n` +
         `签到流量: ${gain}\n` +
         `当前总流量: ${info.total}\n` +
         `已用流量: ${info.used}\n` +
@@ -164,50 +125,114 @@ function checkin() {
   });
 }
 
-function getSubscribe(headers, cb) {
-  const req = {
-    url: CONFIG.SUBSCRIBE_URL,
-    headers,
-    timeout: CONFIG.TIMEOUT,
-  };
+function tryCheckinURLs(urls, headers, idx, cb) {
+  if (idx >= urls.length) return cb("所有候选签到接口都失败（可能站点改版）");
 
-  $httpClient.get(req, (err, resp, data) => {
-    if (err || !resp || resp.status !== 200) {
-      console.log(`[${CONFIG.NAME}] getSubscribe 失败: ${err || (resp && resp.status)}`);
-      return cb({ total: "未知", used: "未知", left: "未知", expire: "未知" });
+  const url = urls[idx];
+  console.log(`[${CONFIG.NAME}] 尝试签到接口: ${url}`);
+
+  const req = { url, headers, body: "{}", timeout: CONFIG.TIMEOUT };
+  $httpClient.post(req, (err, resp, data) => {
+    if (err) {
+      console.log(`[${CONFIG.NAME}] ${url} 网络错误: ${err}`);
+      return tryCheckinURLs(urls, headers, idx + 1, cb);
+    }
+
+    const status = resp ? resp.status : 0;
+    console.log(`[${CONFIG.NAME}] ${url} status=${status} resp=${truncate(data, 200)}`);
+
+    // 404/405 基本可判定接口不对，继续试
+    if (status === 404 || status === 405) {
+      return tryCheckinURLs(urls, headers, idx + 1, cb);
+    }
+
+    // 401/403 表示凭证问题，不再尝试路径
+    if (status === 401 || status === 403) {
+      return cb(`凭证失效（HTTP ${status}），请重新登录抓取 Cookie`);
+    }
+
+    // 其他非200也继续试
+    if (status !== 200) {
+      return tryCheckinURLs(urls, headers, idx + 1, cb);
     }
 
     const j = toJSON(data);
-    if (!j || !j.data) {
-      return cb({ total: "未知", used: "未知", left: "未知", expire: "未知" });
+    if (!j) {
+      // 有些接口返回纯文本成功
+      if (/成功|success|已签到|already/i.test(String(data || ""))) {
+        $persistentStore.write(url, KEY.LAST_GOOD_CHECKIN_URL);
+        return cb(null, { url, msg: String(data), gain: parseGain(String(data)) });
+      }
+      return tryCheckinURLs(urls, headers, idx + 1, cb);
     }
 
-    const d = j.data;
-    const totalB = Number(d.transfer_enable || 0);
-    const usedB = Number(d.u || 0) + Number(d.d || 0);
-    const leftB = totalB - usedB;
+    const msg = j.message || j.msg || (typeof j.data === "string" ? j.data : "") || "";
 
-    cb({
-      total: totalB > 0 ? fmtBytes(totalB) : "未知",
-      used: usedB >= 0 ? fmtBytes(usedB) : "未知",
-      left: leftB >= 0 ? fmtBytes(leftB) : "未知",
-      expire: fmtExpire(d.expired_at || d.expire_at || d.class_expire),
-    });
+    // 已签到
+    if (/已签到|已经签到|already/i.test(msg)) {
+      if (!CONFIG.SILENT_ALREADY) $notification.post(CONFIG.NAME, "今日已签到", msg || "无需重复签到");
+      return cb("今日已签到");
+    }
+
+    const success =
+      j.ret === 1 || j.success === true || j.status === "success" || j.code === 200 || /成功|success|获得/i.test(msg);
+
+    if (!success) return tryCheckinURLs(urls, headers, idx + 1, cb);
+
+    // 成功，记住URL
+    $persistentStore.write(url, KEY.LAST_GOOD_CHECKIN_URL);
+    cb(null, { url, msg, gain: parseGain(msg) });
   });
 }
 
-// ===== utils =====
+function fetchInfoWithFallback(headers, cb) {
+  const lastGood = $persistentStore.read(KEY.LAST_GOOD_INFO_URL);
+  let urls = CONFIG.INFO_CANDIDATES.slice();
+  if (lastGood && urls.indexOf(lastGood) >= 0) {
+    urls = [lastGood].concat(urls.filter((u) => u !== lastGood));
+  }
+
+  function next(i) {
+    if (i >= urls.length) {
+      return cb({ total: "未知", used: "未知", left: "未知", expire: "未知" });
+    }
+
+    const url = urls[i];
+    const req = { url, headers, timeout: CONFIG.TIMEOUT };
+    $httpClient.get(req, (err, resp, data) => {
+      if (err || !resp || resp.status !== 200) return next(i + 1);
+
+      const j = toJSON(data);
+      if (!j) return next(i + 1);
+
+      const d = j.data || j.result || j;
+      const totalB = Number(d.transfer_enable || d.total || 0);
+      const usedB = Number(d.u || 0) + Number(d.d || 0) || Number(d.used || 0);
+      const leftB = totalB > 0 ? totalB - usedB : Number(d.left || d.remain || 0);
+
+      const info = {
+        total: totalB > 0 ? fmtBytes(totalB) : "未知",
+        used: usedB >= 0 ? fmtBytes(usedB) : "未知",
+        left: leftB >= 0 ? fmtBytes(leftB) : "未知",
+        expire: fmtExpire(d.expired_at || d.expire_at || d.class_expire || d.expire),
+      };
+
+      $persistentStore.write(url, KEY.LAST_GOOD_INFO_URL);
+      cb(info);
+    });
+  }
+
+  next(0);
+}
+
+// utils
 function lowerHeaders(h) {
   const o = {};
   Object.keys(h).forEach((k) => (o[k.toLowerCase()] = h[k]));
   return o;
 }
 function toJSON(s) {
-  try {
-    return JSON.parse(s);
-  } catch (_) {
-    return null;
-  }
+  try { return JSON.parse(s); } catch (_) { return null; }
 }
 function truncate(s, n) {
   s = String(s || "");
@@ -235,18 +260,5 @@ function fmtExpire(v) {
 }
 function formatDate(d) {
   const p = (n) => (n < 10 ? "0" + n : "" + n);
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(
-    d.getMinutes()
-  )}:${p(d.getSeconds())}`;
+  return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
-
-/**
- * ===== Surge 配置示例 =====
- *
- * [Script]
- * ikuuu-Cookie-Capture = type=http-request,pattern=^https?:\/\/(ikuuu\.org)\/.*,requires-body=0,script-path=你的路径/ikuuu_checkin.js
- * ikuuu-Auto-Checkin = type=cron,cronexp=5 9 * * *,wake-system=1,timeout=30,script-path=你的路径/ikuuu_checkin.js
- *
- * [MITM]
- * hostname = ikuuu.org
- */
